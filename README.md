@@ -25,7 +25,7 @@ Follow these steps to get the extension running locally:
 
 ## Usage
 1. Open the Search Box:
-    - Press the shortcut `Ctrl+I` by default and `Command+I` in mac to bring up the search box in the top-right corner.
+    - Press the shortcut `Ctrl+I` by default or `Command+I` in mac to bring up the search box in the top-right corner.
 2. Start Searching:
     - Type your search query.
     - Matches highlight in yellow, with the active match in orange.
