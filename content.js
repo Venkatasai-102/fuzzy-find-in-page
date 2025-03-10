@@ -1,38 +1,37 @@
 let matches = [];           // Array to store spans of each match
 let currentMatchIndex = -1; // Index of the currently selected match
+let debounceTimeout = null; // For debouncing input
 
 // Listen for the command to open the fuzzy find input
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     if (request.action === "openFuzzyFind") {
         let inputBox = document.getElementById("fuzzy-find-input");
         if (!inputBox) {
-            // Create input box
             inputBox = document.createElement("input");
             inputBox.id = "fuzzy-find-input";
             inputBox.type = "text";
             inputBox.style.position = "fixed";
             inputBox.style.top = "10px";
-            inputBox.style.right = "10px";
+            inputBox.style.right = "10px"; // Top-right as requested
             inputBox.style.zIndex = "9999";
             inputBox.style.padding = "5px";
             inputBox.style.width = "300px";
             document.body.appendChild(inputBox);
 
-            // Handle typing in the input box
-            inputBox.addEventListener("input", handleInput);
+            inputBox.addEventListener("input", (e) => {
+                clearTimeout(debounceTimeout);
+                debounceTimeout = setTimeout(() => handleInput.call(e.target), 200); // 200ms debounce
+            });
 
-            // Handle Enter, Shift+Enter, and Escape keys
             inputBox.addEventListener("keydown", (event) => {
                 if (event.key === "Enter") {
                     event.preventDefault();
                     if (event.shiftKey) {
-                        // Go to previous match
                         if (matches.length > 0) {
                             currentMatchIndex = (currentMatchIndex - 1 + matches.length) % matches.length;
                             highlightSelectedMatch();
                         }
                     } else {
-                        // Go to next match
                         if (matches.length > 0) {
                             currentMatchIndex = (currentMatchIndex + 1) % matches.length;
                             highlightSelectedMatch();
@@ -48,118 +47,64 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     }
 });
 
-// Process input and highlight matches with locality preference
+// Process input with optimizations for large text
 function handleInput() {
     removeHighlights();
     matches = [];
     currentMatchIndex = -1;
-    const query = this.value.trim();
+    const query = this.value.trim().toLowerCase();
     if (query === "") return;
 
-    // Step 1: Collect and concatenate text nodes
     const textNodes = getAllTextNodes();
-    const segments = [];
-    let currentStart = 0;
-    textNodes.forEach(textNode => {
-        const text = textNode.nodeValue;
-        segments.push({ textNode, startPos: currentStart, length: text.length });
-        currentStart += text.length;
-    });
-    const fullText = textNodes.map(tn => tn.nodeValue).join('');
+    const maxMatches = 100; // Limit to prevent overload
 
-    // Step 2: Precompute positions for each character in the query
-    const queryChars = query.toLowerCase().split('');
-    const positions = {};
-    queryChars.forEach(char => {
-        positions[char] = [];
-        for (let i = 0; i < fullText.length; i++) {
-            if (fullText[i].toLowerCase() === char) {
-                positions[char].push(i);
-            }
+    for (const textNode of textNodes) {
+        const text = textNode.nodeValue.toLowerCase();
+        const nodeMatches = findMatchesInNode(text, query, maxMatches - matches.length);
+        if (nodeMatches.length > 0) {
+            const posToSpan = highlightTextNode(textNode, nodeMatches.flat());
+            nodeMatches.forEach(match => {
+                matches.push(match.map(pos => posToSpan[pos]));
+            });
         }
-    });
-
-    // Step 3: Find non-overlapping matches with the smallest span
-    const matchesPositions = [];
-    let lastEnd = 0;
-    while (true) {
-        let bestMatch = null;
-        let bestSpan = Infinity;
-        const startPositions = positions[queryChars[0]]?.filter(p => p >= lastEnd) || [];
-        if (startPositions.length === 0) break;
-
-        for (const startPos of startPositions) {
-            const match = findEarliestMatch(startPos, queryChars, positions);
-            if (match) {
-                const span = match[match.length - 1] - match[0];
-                if (span < bestSpan) {
-                    bestSpan = span;
-                    bestMatch = match;
-                }
-            }
-        }
-        if (!bestMatch) break;
-        matchesPositions.push(bestMatch);
-        lastEnd = bestMatch[bestMatch.length - 1] + 1;
+        if (matches.length >= maxMatches) break;
     }
 
-    // Step 4: Highlight all positions in the matches
-    const allPositions = new Set(matchesPositions.flat());
-    const posToSpan = {};
-    highlightPositions(fullText, segments, allPositions, posToSpan);
-
-    // Step 5: Convert matches to spans for navigation
-    matches = matchesPositions.map(match => match.map(p => posToSpan[p]));
     if (matches.length > 0) {
         currentMatchIndex = 0;
         highlightSelectedMatch();
     }
 }
 
-// Find the earliest completion of the query starting from startPos
-function findEarliestMatch(startPos, queryChars, positions) {
-    const match = [startPos];
+// Find non-overlapping matches in a single text node
+function findMatchesInNode(text, query, maxMatches) {
+    const matches = [];
+    let pos = 0;
+    const queryChars = query.split('');
+
+    while (pos < text.length && matches.length < maxMatches) {
+        const match = findNextMatch(text, queryChars, pos);
+        if (!match) break;
+        matches.push(match);
+        pos = match[match.length - 1] + 1; // Skip past this match
+    }
+    return matches;
+}
+
+// Find the next match starting from pos with locality preference
+function findNextMatch(text, queryChars, startPos) {
+    const match = [];
     let currentPos = startPos;
-    for (let i = 1; i < queryChars.length; i++) {
-        const char = queryChars[i];
-        const nextPos = positions[char]?.find(p => p > currentPos);
-        if (nextPos === undefined) return null;
-        match.push(nextPos);
-        currentPos = nextPos;
+
+    for (const char of queryChars) {
+        while (currentPos < text.length && text[currentPos] !== char) {
+            currentPos++;
+        }
+        if (currentPos >= text.length) return null;
+        match.push(currentPos);
+        currentPos++;
     }
     return match;
-}
-
-// Highlight positions and map global positions to their spans
-function highlightPositions(fullText, segments, positions, posToSpan) {
-    const positionsByNode = new Map();
-    positions.forEach(p => {
-        const result = getTextNodeAndLocalPos(p, segments);
-        if (result) {
-            const { textNode, localPos } = result;
-            if (!positionsByNode.has(textNode)) positionsByNode.set(textNode, []);
-            positionsByNode.get(textNode).push(localPos);
-        }
-    });
-
-    for (const [textNode, localPositions] of positionsByNode) {
-        const sortedPositions = [...new Set(localPositions)].sort((a, b) => a - b);
-        const localPosToSpan = highlightTextNode(textNode, sortedPositions);
-        sortedPositions.forEach(localPos => {
-            const globalPos = segments.find(seg => seg.textNode === textNode).startPos + localPos;
-            posToSpan[globalPos] = localPosToSpan[localPos];
-        });
-    }
-}
-
-// Get the text node and local position for a global position
-function getTextNodeAndLocalPos(globalPos, segments) {
-    for (const segment of segments) {
-        if (globalPos >= segment.startPos && globalPos < segment.startPos + segment.length) {
-            return { textNode: segment.textNode, localPos: globalPos - segment.startPos };
-        }
-    }
-    return null;
 }
 
 // Highlight positions in a specific text node
@@ -174,7 +119,8 @@ function highlightTextNode(textNode, positions) {
     let lastPos = 0;
     const localPosToSpan = {};
 
-    positions.forEach(pos => {
+    const sortedPositions = [...new Set(positions)].sort((a, b) => a - b);
+    sortedPositions.forEach(pos => {
         if (pos > lastPos) {
             fragment.appendChild(document.createTextNode(text.substring(lastPos, pos)));
         }
